@@ -1,4 +1,4 @@
-"""Contract tests for the SalesIntel AI FastAPI host (dependency-free).
+"""Contract tests for the SalesRadar FastAPI host (dependency-free).
 
 ``pytest`` is not installed in this project and adding dependencies is out of
 scope, so this module is a plain-Python test runner built on FastAPI's
@@ -58,7 +58,7 @@ def test_index_renders_html() -> None:
     response = client.get("/")
     assert response.status_code == 200, response.status_code
     assert response.headers["content-type"].startswith("text/html")
-    assert "SalesIntel" in response.text
+    assert "SalesRadar" in response.text
     assert response.headers["cache-control"] == "no-store"
 
 
@@ -79,7 +79,7 @@ def test_health_shape() -> None:
     body: dict[str, Any] = response.json()
 
     assert body["status"] == "ok"
-    assert body["service"] == "salesintel-ai"
+    assert body["service"] == "salesradar"
     assert isinstance(body["version"], str) and body["version"]
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", body["time"])
 

@@ -7,7 +7,7 @@
 (function () {
   "use strict";
 
-  var STORAGE_KEY = "salesintel.settings.v1";
+  var STORAGE_KEY = "salesradar.settings.v1";
   var root = document.documentElement;
   var settings = {};
 

@@ -1,4 +1,4 @@
-# SalesIntel AI — API reference
+# SalesRadar — API reference
 
 HTTP contract for the SalesRadar backend host (`main.py`). The UI is
 **contract-first**: it calls `GET /health` on load and renders honest
@@ -53,7 +53,7 @@ never returned or logged.
 ```json
 {
   "status": "ok",
-  "service": "salesintel-ai",
+  "service": "salesradar",
   "version": "0.1.0",
   "time": "2026-11-27T08:30:41Z",
   "model": { "id": "openai/gpt-oss-120b", "provider": "Groq" },

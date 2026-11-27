@@ -1,4 +1,4 @@
-"""SalesIntel AI — FastAPI host for the SalesRadar research workspace.
+"""SalesRadar — FastAPI host for the SalesRadar research workspace.
 
 This module intentionally implements *only* the HTTP host and its honest
 capability reporting. The LangGraph research pipeline (web research, company
@@ -35,7 +35,7 @@ from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateNotFound
 from pydantic import BaseModel, Field, field_validator
 
-logger = logging.getLogger("salesintel")
+logger = logging.getLogger("salesradar")
 
 # --------------------------------------------------------------------------- #
 # Paths, constants
@@ -47,7 +47,7 @@ STATIC_DIR: Final[Path] = BASE_DIR / "static"
 ENV_FILE: Final[Path] = BASE_DIR / ".env"
 PYPROJECT_FILE: Final[Path] = BASE_DIR / "pyproject.toml"
 
-SERVICE_NAME: Final[str] = "salesintel-ai"
+SERVICE_NAME: Final[str] = "salesradar"
 DEFAULT_VERSION: Final[str] = "0.1.0"
 DEFAULT_MODEL_ID: Final[str] = "openai/gpt-oss-120b"
 
@@ -300,7 +300,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     load_dotenv(dotenv_path=ENV_FILE, override=False)
     logger.info(
-        "SalesIntel AI host starting | llm_configured=%s research_configured=%s "
+        "SalesRadar host starting | llm_configured=%s research_configured=%s "
         "pipeline=unavailable",
         _env_present("GROQ_API_KEY"),
         _env_present("TREG_API_KEY"),
@@ -308,11 +308,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        logger.info("SalesIntel AI host stopped")
+        logger.info("SalesRadar host stopped")
 
 
 app = FastAPI(
-    title="SalesIntel AI API",
+    title="SalesRadar API",
     description=(
         "FastAPI host for the SalesRadar sales-intelligence workspace.\n\n"
         "**Status:** the HTTP host and honest capability reporting are "

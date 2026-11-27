@@ -6,8 +6,8 @@
  */
 
 export const STORAGE_KEYS = Object.freeze({
-  settings: "salesintel.settings.v1",
-  threads: "salesintel.threads.v1",
+  settings: "salesradar.settings.v1",
+  threads: "salesradar.threads.v1",
 });
 
 export const LIMITS = Object.freeze({

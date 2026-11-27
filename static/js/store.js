@@ -12,7 +12,7 @@ import { uid } from "./util.js";
 /** @returns {Storage|null} */
 function storage() {
   try {
-    const probe = "__salesintel_probe__";
+    const probe = "__salesradar_probe__";
     window.localStorage.setItem(probe, "1");
     window.localStorage.removeItem(probe);
     return window.localStorage;

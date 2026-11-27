@@ -1,4 +1,4 @@
-# SalesIntel AI
+# SalesRadar
 
 A multi-agent sales-intelligence workspace: research a company, map its buying
 committee, and produce an evidence-backed sales brief — with every claim tied to

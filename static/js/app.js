@@ -1,5 +1,5 @@
 /**
- * SalesIntel AI — application controller.
+ * SalesRadar — application controller.
  *
  * Wires the DOM shell to the API client, thread store and renderer.
  * The interface is contract-first: it adapts to what `GET /health` reports and
@@ -337,7 +337,7 @@ function refreshSystemPanel() {
   );
 
   const facts = [
-    { label: "Service", value: health.service || "salesintel-ai" },
+    { label: "Service", value: health.service || "salesradar" },
     { label: "Version", value: health.version || "not reported" },
     { label: "Model", value: health.model?.id || "not reported" },
     { label: "Provider", value: health.model?.provider || "not reported" },
@@ -1098,7 +1098,7 @@ function newThread() {
    ========================================================================== */
 
 function bindSidebar() {
-  const stored = window.localStorage.getItem("salesintel.sidebar.v1");
+  const stored = window.localStorage.getItem("salesradar.sidebar.v1");
   if (window.matchMedia("(max-width: 980px)").matches) {
     setSidebarState("closed", { persist: false });
   } else if (stored === "closed") {
@@ -1125,7 +1125,7 @@ function setSidebarState(state, options = {}) {
 
   if (options.persist !== false) {
     try {
-      window.localStorage.setItem("salesintel.sidebar.v1", state);
+      window.localStorage.setItem("salesradar.sidebar.v1", state);
     } catch {
       /* storage may be unavailable */
     }
@@ -1418,7 +1418,7 @@ function bindMediaQueries() {
     if (event.matches) {
       setSidebarState("closed", { persist: false });
     } else {
-      const stored = window.localStorage.getItem("salesintel.sidebar.v1");
+      const stored = window.localStorage.getItem("salesradar.sidebar.v1");
       setSidebarState(stored === "closed" ? "closed" : "open", { persist: false });
     }
   });

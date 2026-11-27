@@ -1,25 +1,15 @@
-"""Contract tests for the SalesRadar FastAPI host (dependency-free).
-
-``pytest`` is not installed in this project and adding dependencies is out of
-scope, so this module is a plain-Python test runner built on FastAPI's
-``TestClient`` (backed by the already-installed ``httpx``).
-
-Run with::
-
-    .venv\\Scripts\\python.exe tests\\test_api.py
-
-It exits non-zero and prints every failure if any assertion does not hold.
-The assertions encode the *honest* contract: real health reporting and explicit
-501s — never fabricated research output.
-"""
+"""Contract tests for the SalesRadar FastAPI host, guardrails, and pipeline wiring."""
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import sys
 import traceback
 from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import patch
 
 # Allow `python tests/test_api.py` from the project root.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -28,17 +18,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+import main as app_module  # noqa: E402
+from graph import run_research  # noqa: E402
+from guardrails import public_data, safe_url, valid_company, valid_query  # noqa: E402
 from main import app  # noqa: E402
 
 client = TestClient(app)
 
-EXPECTED_CAPABILITIES: dict[str, bool] = {
-    "research": False,
-    "streaming": False,
-    "history": False,
-    "citations": False,
-    "cost_reporting": False,
-}
 EXPECTED_CHECK_IDS: list[str] = ["api", "llm", "research", "pipeline"]
 REQUIRED_HEADERS: dict[str, str] = {
     "x-content-type-options": "nosniff",
@@ -46,6 +32,26 @@ REQUIRED_HEADERS: dict[str, str] = {
     "x-frame-options": "DENY",
     "permissions-policy": "interest-cohort=()",
 }
+
+
+def _fake_run_result(
+    query: str,
+    *,
+    company_name: str | None = None,
+    focus: str | None = None,
+    demo: bool = False,
+    on_event: Any = None,
+) -> dict[str, Any]:
+    if on_event is not None:
+        on_event({"event": "stage", "stage": "web", "state": "running", "detail": "Searching"})
+        on_event({"event": "stage", "stage": "web", "state": "complete", "detail": "Done", "duration_ms": 12})
+    return run_research(
+        query,
+        company_name=company_name,
+        focus=focus,
+        demo=True,
+        on_event=on_event,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -72,9 +78,10 @@ def test_index_headers() -> None:
     assert "frame-ancestors 'none'" in csp
 
 
-def test_health_shape() -> None:
-    """`GET /health` returns the full honest shape the UI relies on."""
-    response = client.get("/health")
+def test_health_shape_reflects_env() -> None:
+    """`GET /health` returns real env status and matching capabilities."""
+    with patch.dict(os.environ, {"GROQ_API_KEY": "test-groq", "TREG_API_KEY": "test-treg"}):
+        response = client.get("/health")
     assert response.status_code == 200
     body: dict[str, Any] = response.json()
 
@@ -92,45 +99,92 @@ def test_health_shape() -> None:
         assert set(check) == {"id", "label", "state", "detail"}
         assert check["state"] in {"ok", "degraded", "unavailable"}
     assert checks["api"]["state"] == "ok"
-    assert checks["pipeline"]["state"] == "unavailable"
+    assert checks["pipeline"]["state"] == "ok"
 
-    assert body["capabilities"] == EXPECTED_CAPABILITIES
+    assert body["capabilities"] == {
+        "research": True,
+        "streaming": True,
+        "history": False,
+        "citations": True,
+        "cost_reporting": True,
+    }
     assert body["limits"] == {"max_query_chars": 600, "min_query_chars": 2}
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_health_degraded_without_keys() -> None:
+    """`GET /health` reports degraded and false capabilities when keys are absent."""
+    with patch.dict(os.environ, {"GROQ_API_KEY": "", "TREG_API_KEY": ""}):
+        response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    checks = {check["id"]: check for check in body["checks"]}
+    assert checks["llm"]["state"] == "degraded"
+    assert checks["research"]["state"] == "degraded"
+    assert checks["pipeline"]["state"] == "degraded"
+    assert body["capabilities"]["research"] is False
+    assert body["capabilities"]["streaming"] is False
 
 
 def test_health_never_leaks_secrets() -> None:
     """Health output must never echo credential values."""
     body = client.get("/health").text
-    assert "GROQ_API_KEY" not in body
-    assert "TREG_API_KEY" not in body
+    assert "GROQ_API_KEY" not in body or "not configured" in body
+    assert "TREG_API_KEY" not in body or "not configured" in body
     assert "gsk_" not in body
 
 
-def test_research_returns_honest_501() -> None:
-    """`POST /research` answers 501 with a machine-readable code."""
-    response = client.post("/research", json={"query": "Research Notion GTM"})
-    assert response.status_code == 501, response.status_code
+def test_research_returns_503_when_unconfigured() -> None:
+    """`POST /research` answers 503 when credentials are missing."""
+    with patch.dict(os.environ, {"GROQ_API_KEY": "", "TREG_API_KEY": ""}):
+        response = client.post("/research", json={"query": "Huawei"})
+    assert response.status_code == 503, response.status_code
     body = response.json()
-    assert body["code"] == "pipeline_not_implemented"
-    assert body["detail"].startswith("The research pipeline is not implemented")
-    assert len(body["required_capabilities"]) == 4
-    assert response.headers["cache-control"] == "no-store"
-    for forbidden in ("report", "citations", "stages", "usage", "cost"):
-        assert forbidden not in body
+    assert body["code"] == "pipeline_not_configured"
 
 
-def test_stream_returns_honest_501() -> None:
-    """`POST /research/stream` answers 501 with the streaming code."""
-    response = client.post("/research/stream", json={"query": "Research Notion GTM"})
-    assert response.status_code == 501, response.status_code
+def test_research_runs_pipeline_contract() -> None:
+    """`POST /research` returns the normalised RunResult contract."""
+    with (
+        patch.dict(os.environ, {"GROQ_API_KEY": "test-groq", "TREG_API_KEY": "test-treg"}),
+        patch.object(app_module, "run_research", side_effect=_fake_run_result),
+    ):
+        response = client.post(
+            "/research",
+            json={"query": "Huawei", "focus": "decision-makers"},
+        )
+    assert response.status_code == 200, response.text
     body = response.json()
-    assert body["code"] == "streaming_not_implemented"
-    assert len(body["required_capabilities"]) == 4
+    assert body["status"] == "complete"
+    assert body["company"]["name"] == "Huawei"
+    assert body["focus"] == "decision-makers"
+    assert "DEMO ONLY" in body["report"]
+    assert len(body["stages"]) == 4
+    assert "cost_usd" in body["usage"]
+    assert "duration_ms" in body["usage"]
+
+
+def test_stream_emits_sse_events() -> None:
+    """`POST /research/stream` streams stage events and a final done payload."""
+    with (
+        patch.dict(os.environ, {"GROQ_API_KEY": "test-groq", "TREG_API_KEY": "test-treg"}),
+        patch.object(app_module, "run_research", side_effect=_fake_run_result),
+    ):
+        response = client.post("/research/stream", json={"query": "Stripe"})
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events: list[dict[str, Any]] = []
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            events.append(json.loads(line[6:]))
+    assert any(ev.get("event") == "stage" for ev in events)
+    done_events = [ev for ev in events if ev.get("event") == "done"]
+    assert len(done_events) == 1
+    assert done_events[0]["result"]["company"]["name"] == "Stripe"
 
 
 def test_research_rejects_invalid_bodies() -> None:
-    """Pydantic rejects malformed bodies with 422, not a fake success."""
+    """Pydantic rejects malformed bodies with 422."""
     invalid_payloads: list[dict[str, Any]] = [
         {},
         {"query": ""},
@@ -143,17 +197,17 @@ def test_research_rejects_invalid_bodies() -> None:
         assert status == 422, f"{payload!r} -> {status}"
 
 
-def test_research_accepts_full_contract_body() -> None:
-    """All optional contract fields are accepted (still 501, never fabricated)."""
-    response = client.post(
-        "/research",
-        json={
-            "query": "Find decision-makers at Notion who own developer tooling",
-            "company_name": "Notion",
-            "focus": "developer tooling",
-        },
-    )
-    assert response.status_code == 501
+def test_guardrails_helpers() -> None:
+    """Guardrail helpers validate inputs, HTTPS URLs, and strip PII."""
+    assert valid_company("  Stripe, Inc. ") == "Stripe, Inc."
+    assert valid_query("Who are the decision-makers at Stripe?") == "Who are the decision-makers at Stripe?"
+    assert safe_url("https://stripe.com/docs") is True
+    assert safe_url("http://stripe.com") is False
+    assert safe_url("https://127.0.0.1/admin") is False
+    assert safe_url("https://user:pass@stripe.com") is False
+    cleaned = public_data({"name": "Ada", "email": "ada@example.com", "bio": "Reach ada@example.com"})
+    assert "email" not in cleaned
+    assert cleaned["bio"] == "Reach [redacted]"
 
 
 def test_docs_available_and_csp_exempt() -> None:
@@ -179,11 +233,7 @@ def test_unknown_path_returns_json_404() -> None:
 
 
 def test_static_mount_serves_existing_assets() -> None:
-    """The `/static` mount resolves real files with a cache header.
-
-    The asset is discovered dynamically because `static/` is owned and rewritten
-    by the frontend team.
-    """
+    """The `/static` mount resolves real files with a cache header."""
     static_dir = PROJECT_ROOT / "static"
     assets = sorted(path for path in static_dir.rglob("*") if path.is_file())
     assert assets, "static/ contains no files to probe the /static mount with"

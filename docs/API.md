@@ -16,11 +16,11 @@ the endpoints that would run it answer `501` with a machine-readable `code`.
 | Capability | Implemented | Reported as |
 | --- | --- | --- |
 | HTTP host, health, static UI | ✅ | — |
-| `POST /research` (run pipeline) | ❌ (501) | `capabilities.research = false` |
-| `POST /research/stream` (SSE) | ❌ (501) | `capabilities.streaming = false` |
+| `POST /research` (run pipeline) | ✅ | `capabilities.research = true` (when keys set) |
+| `POST /research/stream` (SSE) | ✅ | `capabilities.streaming = true` (when keys set) |
 | Report persistence `GET /reports/{id}` | ❌ (not routed) | `capabilities.history = false` |
-| Citations | ❌ | `capabilities.citations = false` |
-| Cost / duration telemetry | ❌ | `capabilities.cost_reporting = false` |
+| Citations | ✅ | `capabilities.citations = true` (when keys set) |
+| Cost / duration telemetry | ✅ | `capabilities.cost_reporting = true` (when keys set) |
 
 ## Endpoints
 

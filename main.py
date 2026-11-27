@@ -1,24 +1,19 @@
 """SalesRadar — FastAPI host for the SalesRadar research workspace.
 
-This module intentionally implements *only* the HTTP host and its honest
-capability reporting. The LangGraph research pipeline (web research, company
-intelligence, people research, report writer) does not exist yet, so every
-endpoint that would run it returns an explicit HTTP 501 with a machine-readable
-``code`` field instead of fabricated reports, citations, stages, costs or
-metrics.
+Connects the contract-first frontend (`templates/index.html` + `static/`) to
+the LangGraph multi-agent research pipeline (`graph.py`, `guardrails.py`,
+`treg_tools.py`).
 
 Run locally::
 
     .venv\\Scripts\\python.exe main.py
     # or: .venv\\Scripts\\python.exe -m uvicorn main:app --port 8000
-
-The frontend is contract-first: it reads ``/health`` and disables features whose
-capabilities are reported as unavailable, so this file must never overstate
-what the backend can do.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import tomllib
@@ -29,11 +24,13 @@ from typing import Any, AsyncIterator, Final
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateNotFound
 from pydantic import BaseModel, Field, field_validator
+
+from graph import run_research
 
 logger = logging.getLogger("salesradar")
 
@@ -53,20 +50,6 @@ DEFAULT_MODEL_ID: Final[str] = "openai/gpt-oss-120b"
 
 MIN_QUERY_CHARS: Final[int] = 2
 MAX_QUERY_CHARS: Final[int] = 600
-
-PIPELINE_UNAVAILABLE_DETAIL: Final[str] = (
-    "The research pipeline is not implemented on this backend yet. "
-    "The interface is wired to this contract and will render a run as soon as "
-    "the agent pipeline is available."
-)
-
-# Capabilities a real run would need that this host does not provide yet.
-REQUIRED_PIPELINE_CAPABILITIES: Final[list[str]] = [
-    "POST /research returning a RunResult (see docs/API.md)",
-    "Server-Sent Events progress on POST /research/stream",
-    "Server-side report persistence (GET /reports/{id})",
-    "Per-run cost + duration telemetry",
-]
 
 # Browser-hardening headers applied to every response except the CSP-exempt
 # interactive API documentation routes (Swagger UI / ReDoc load CDN assets).
@@ -129,6 +112,11 @@ def _env_present(var_name: str) -> bool:
     return bool(os.getenv(var_name, "").strip())
 
 
+def _pipeline_ready() -> bool:
+    """Return True when both LLM and Treg credentials are configured."""
+    return _env_present("GROQ_API_KEY") and _env_present("TREG_API_KEY")
+
+
 def _utc_now_iso() -> str:
     """Return the current UTC time as ISO-8601 with a trailing ``Z``."""
     return (
@@ -139,13 +127,11 @@ def _utc_now_iso() -> str:
 
 
 def _build_checks() -> list[dict[str, str]]:
-    """Build the honest health check list from real environment presence.
-
-    The pipeline check is always ``unavailable``: no agent graph is implemented.
-    """
+    """Build the honest health check list from real environment presence."""
     model_id = _configured_model_id()
     llm_ok = _env_present("GROQ_API_KEY")
     research_ok = _env_present("TREG_API_KEY")
+    pipeline_ok = llm_ok and research_ok
 
     return [
         {
@@ -177,14 +163,19 @@ def _build_checks() -> list[dict[str, str]]:
         {
             "id": "pipeline",
             "label": "Agent pipeline",
-            "state": "unavailable",
-            "detail": "LangGraph research pipeline is not implemented yet",
+            "state": "ok" if pipeline_ok else "degraded",
+            "detail": (
+                "LangGraph multi-agent pipeline ready"
+                if pipeline_ok
+                else "Requires GROQ_API_KEY and TREG_API_KEY"
+            ),
         },
     ]
 
 
 def _health_payload() -> dict[str, Any]:
     """Build the complete, honest ``GET /health`` response body."""
+    ready = _pipeline_ready()
     return {
         "status": "ok",
         "service": SERVICE_NAME,
@@ -193,11 +184,11 @@ def _health_payload() -> dict[str, Any]:
         "model": {"id": _configured_model_id(), "provider": "Groq"},
         "checks": _build_checks(),
         "capabilities": {
-            "research": False,
-            "streaming": False,
+            "research": ready,
+            "streaming": ready,
             "history": False,
-            "citations": False,
-            "cost_reporting": False,
+            "citations": ready,
+            "cost_reporting": ready,
         },
         "limits": {
             "max_query_chars": MAX_QUERY_CHARS,
@@ -206,13 +197,24 @@ def _health_payload() -> dict[str, Any]:
     }
 
 
-def _not_implemented_payload(code: str) -> dict[str, Any]:
-    """Build the shared honest 501 body used by both research endpoints."""
-    return {
-        "detail": PIPELINE_UNAVAILABLE_DETAIL,
-        "code": code,
-        "required_capabilities": list(REQUIRED_PIPELINE_CAPABILITIES),
-    }
+def _not_configured_response() -> JSONResponse:
+    """Return an explicit 503 when required API credentials are absent."""
+    missing: list[str] = []
+    if not _env_present("GROQ_API_KEY"):
+        missing.append("GROQ_API_KEY")
+    if not _env_present("TREG_API_KEY"):
+        missing.append("TREG_API_KEY")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": (
+                "The research pipeline requires credentials that are not configured: "
+                + ", ".join(missing)
+            ),
+            "code": "pipeline_not_configured",
+            "required_capabilities": [f"Configure {name} in .env" for name in missing],
+        },
+    )
 
 
 def _is_csp_exempt(path: str) -> bool:
@@ -221,13 +223,13 @@ def _is_csp_exempt(path: str) -> bool:
 
 
 def _apply_cache_headers(request: Request, response: Response) -> None:
-    """Apply cache policy: HTML/JSON never cached, static assets cached briefly."""
+    """Apply cache policy: HTML/JSON/SSE never cached, static assets cached briefly."""
     path = request.url.path
     content_type = response.headers.get("content-type", "")
 
     if path.startswith("/static") and response.status_code < 400:
         response.headers.setdefault("Cache-Control", _STATIC_CACHE_CONTROL)
-    elif content_type.startswith(("text/html", "application/json")):
+    elif content_type.startswith(("text/html", "application/json", "text/event-stream")):
         response.headers.setdefault("Cache-Control", _NO_STORE)
 
 
@@ -237,12 +239,7 @@ def _apply_cache_headers(request: Request, response: Response) -> None:
 
 
 class ResearchRequest(BaseModel):
-    """Body for ``POST /research`` (and, later, ``POST /research/stream``).
-
-    Mirrors the frontend contract: a required query plus optional narrowing
-    hints. Nothing is executed today — validation is wired so that a future
-    pipeline receives a well-formed, bounded request.
-    """
+    """Body for ``POST /research`` and ``POST /research/stream``."""
 
     query: str = Field(
         min_length=MIN_QUERY_CHARS,
@@ -301,9 +298,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     load_dotenv(dotenv_path=ENV_FILE, override=False)
     logger.info(
         "SalesRadar host starting | llm_configured=%s research_configured=%s "
-        "pipeline=unavailable",
+        "pipeline_ready=%s",
         _env_present("GROQ_API_KEY"),
         _env_present("TREG_API_KEY"),
+        _pipeline_ready(),
     )
     try:
         yield
@@ -314,11 +312,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="SalesRadar API",
     description=(
-        "FastAPI host for the SalesRadar sales-intelligence workspace.\n\n"
-        "**Status:** the HTTP host and honest capability reporting are "
-        "implemented. The LangGraph research pipeline is not: `POST /research` "
-        "and `POST /research/stream` currently answer `501` with "
-        "`code: \"pipeline_not_implemented\"` / `\"streaming_not_implemented\"`."
+        "FastAPI host for the SalesRadar multi-agent sales-intelligence workspace."
     ),
     version=_read_project_version(),
     lifespan=lifespan,
@@ -334,13 +328,7 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 @app.middleware("http")
 async def security_and_cache_headers(request: Request, call_next: Any) -> Response:
-    """Attach security and cache headers to every response.
-
-    CSP is skipped for ``/docs``, ``/redoc`` and ``/openapi.json`` because
-    Swagger UI and ReDoc load their assets from a CDN; the strict policy would
-    break that interactive documentation. All application routes (including
-    ``/`` and ``/health``) keep the strict ``default-src 'self'`` policy.
-    """
+    """Attach security and cache headers to every response."""
     response = await call_next(request)
     for header_name, header_value in _SECURITY_HEADERS.items():
         response.headers.setdefault(header_name, header_value)
@@ -357,12 +345,7 @@ async def security_and_cache_headers(request: Request, call_next: Any) -> Respon
 
 @app.get("/", response_class=Response, tags=["ui"], summary="Research workspace UI")
 async def index(request: Request) -> Response:
-    """Render the single-page research workspace from ``templates/index.html``.
-
-    No environment values are placed in the template context, so credentials can
-    never leak into rendered HTML. If the template is missing the host answers
-    with an honest ``503`` instead of an unhandled exception.
-    """
+    """Render the single-page research workspace from ``templates/index.html``."""
     try:
         return templates.TemplateResponse(
             request=request,
@@ -382,64 +365,123 @@ async def index(request: Request) -> Response:
 
 @app.get("/health", tags=["health"], summary="Honest service health & capabilities")
 async def health() -> dict[str, Any]:
-    """Report real service health, configured model, and capability flags.
-
-    ``checks`` reflect only the presence of credentials in the environment.
-    ``capabilities`` are all ``false`` because the research pipeline, streaming,
-    report persistence, citations and cost telemetry are not implemented.
-    """
+    """Report real service health, configured model, and capability flags."""
     return _health_payload()
 
 
-@app.post("/research", tags=["research"], summary="Run research (not implemented)")
+@app.post("/research", tags=["research"], summary="Run multi-agent sales research")
 async def research(payload: ResearchRequest) -> Response:
-    """Validate a research request and honestly report it cannot run yet.
+    """Run the 4-agent LangGraph research pipeline and return a ``RunResult``."""
+    if not _pipeline_ready():
+        return _not_configured_response()
 
-    The body is fully validated (so the contract is executable today), then the
-    endpoint returns ``501`` — never a fabricated run, report or citation.
-    """
     logger.info(
-        "POST /research rejected: pipeline not implemented "
-        "(query_chars=%d, company_name=%s, focus=%s)",
+        "POST /research started (query_chars=%d, company_name=%s, focus=%s)",
         len(payload.query),
         bool(payload.company_name),
         bool(payload.focus),
     )
-    return JSONResponse(
-        status_code=501,
-        content=_not_implemented_payload("pipeline_not_implemented"),
-    )
+    try:
+        result = await asyncio.to_thread(
+            run_research,
+            payload.query,
+            company_name=payload.company_name,
+            focus=payload.focus,
+            demo=False,
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": str(exc), "code": "invalid_input"},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("POST /research failed: %s", type(exc).__name__)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "detail": str(exc) or "Research pipeline execution failed.",
+                "code": "pipeline_failed",
+            },
+        )
+
+    return JSONResponse(status_code=200, content=result)
 
 
 @app.post(
     "/research/stream",
     tags=["research"],
-    summary="Stream research progress over SSE (not implemented)",
+    summary="Stream research progress over SSE",
 )
 async def research_stream(payload: ResearchRequest) -> Response:
-    """Validate a streaming research request and return the honest 501.
+    """Run the research pipeline and stream stage/completion events over SSE."""
+    if not _pipeline_ready():
+        return _not_configured_response()
 
-    The frontend only calls this route when ``/health`` reports
-    ``capabilities.streaming = true``, which it does not.
-    """
     logger.info(
-        "POST /research/stream rejected: streaming not implemented "
-        "(query_chars=%d)",
+        "POST /research/stream started (query_chars=%d, company_name=%s, focus=%s)",
         len(payload.query),
+        bool(payload.company_name),
+        bool(payload.focus),
     )
-    return JSONResponse(
-        status_code=501,
-        content=_not_implemented_payload("streaming_not_implemented"),
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    def on_event(event: dict[str, Any]) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    async def worker() -> None:
+        try:
+            result = await asyncio.to_thread(
+                run_research,
+                payload.query,
+                company_name=payload.company_name,
+                focus=payload.focus,
+                demo=False,
+                on_event=on_event,
+            )
+            await queue.put({"event": "done", "result": result})
+        except ValueError as exc:
+            await queue.put({"event": "error", "code": "invalid_input", "detail": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("POST /research/stream failed: %s", type(exc).__name__)
+            await queue.put(
+                {
+                    "event": "error",
+                    "code": "pipeline_failed",
+                    "detail": str(exc) or "Research pipeline execution failed.",
+                }
+            )
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(worker())
+
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                event_name = str(item.get("event") or "message")
+                yield f"event: {event_name}\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": _NO_STORE,
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon() -> Response:
-    """Serve a favicon without 404 noise.
-
-    Redirects to ``/static/favicon.svg`` when the asset exists (the UI may add
-    it), otherwise answers ``204 No Content``.
-    """
+    """Serve a favicon without 404 noise."""
     favicon_svg = STATIC_DIR / "favicon.svg"
     if favicon_svg.is_file():
         return RedirectResponse(url="/static/favicon.svg", status_code=307)
